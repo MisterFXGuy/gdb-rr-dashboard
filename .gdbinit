@@ -10,6 +10,9 @@ import os
 import re
 import struct
 import termios
+import time
+
+profileModules = True
 
 # Common attributes ------------------------------------------------------------
 
@@ -250,8 +253,16 @@ class Dashboard(gdb.Command):
                 continue
             module = module.instance
             # active if more than zero lines
+
+            start = time.time()
             module_lines = module.lines()
-            lines.append(divider(module.label(), True, module_lines))
+            duration = time.time() - start
+
+            label = module.label()
+            if profileModules:
+                label = label + " (" + ("%.2f" % (duration * 1000)) + "ms)"
+
+            lines.append(divider(label, True, module_lines))
             lines.extend(module_lines)
         if len(lines) == 0:
             lines.append(divider('Error', True))
@@ -831,6 +842,8 @@ location, if available. Optionally list the frame arguments and locals too."""
                     frame_lines.append(ansi('(no locals)', R.style_low))
             # add frame
             frames.append(frame_lines)
+            if self.limit and self.limit <= len(frames):
+                break
             # next
             frame = frame.older()
             number += 1
@@ -906,8 +919,11 @@ location, if available. Optionally list the frame arguments and locals too."""
             }
         }
 
+'''
 class History(Dashboard.Module):
     """List the last entries of the value history."""
+    def __init__(self):
+        self.enabled = False
 
     def label(self):
         return 'History'
@@ -934,106 +950,52 @@ class History(Dashboard.Module):
                 'check': check_gt_zero
             }
         }
+'''
 
-class Memory(Dashboard.Module):
-    """Allow to inspect memory regions."""
-
-    @staticmethod
-    def format_byte(byte):
-        # `type(byte) is bytes` in Python 3
-        if byte.isspace():
-            return ' '
-        elif 0x20 < ord(byte) < 0x7e:
-            return chr(ord(byte))
-        else:
-            return '.'
-
-    @staticmethod
-    def parse_as_address(expression):
-        value = gdb.parse_and_eval(expression)
-        return to_unsigned(value)
+class RREvents(Dashboard.Module):
+    """Show the RR replay events."""
 
     def __init__(self):
-        self.row_length = 16
-        self.table = {}
-
-    def format_memory(self, start, memory):
-        out = []
-        for i in range(0, len(memory), self.row_length):
-            region = memory[i:i + self.row_length]
-            pad = self.row_length - len(region)
-            address = format_address(start + i)
-            hexa = (' '.join('{:02x}'.format(ord(byte)) for byte in region))
-            text = (''.join(Memory.format_byte(byte) for byte in region))
-            out.append('{} {}{} {}{}'.format(ansi(address, R.style_low),
-                                             hexa,
-                                             ansi(pad * ' --', R.style_low),
-                                             ansi(text, R.style_high),
-                                             ansi(pad * '.', R.style_low)))
-        return out
+        self.curr_event_id = None
 
     def label(self):
-        return 'Memory'
+        return 'RR Events (' + str(self.curr_event_id) + ")"
 
     def lines(self):
+        self.curr_event_id = int(run('when').split(" ")[2].rstrip())
+        start = self.curr_event_id - 3 
+        end = self.curr_event_id + 3 
+        next_thread = run("rr-next_thread").rstrip()
+        lines = run("rr-dump %i %i" % (start, end)).split("\n")
+
         out = []
-        inferior = gdb.selected_inferior()
-        for address, length in sorted(self.table.items()):
-            try:
-                memory = inferior.read_memory(address, length)
-                out.extend(self.format_memory(address, memory))
-            except gdb.error:
-                msg = 'Cannot access {} bytes starting at {}'
-                msg = msg.format(length, format_address(address))
-                out.append(ansi(msg, R.style_error))
-            out.append(divider())
-        # drop last divider
-        if out:
-            del out[-1]
-        return out
 
-    def watch(self, arg):
-        if arg:
-            address, _, length = arg.partition(' ')
-            address = Memory.parse_as_address(address)
-            if length:
-                length = Memory.parse_as_address(length)
+        prev_thread_tid = next_thread.split(":")[0].split(",")[0]
+        prev_thread_time = next_thread.split(":")[0].split(",")[1]
+        if prev_thread_tid != "-1":
+            out.append("  " + prev_thread_time + ": (tid:" + prev_thread_tid + ") Thread Switch")
+            out.append("  (...)")
+        else:
+            out.append("  0: (tid:" + prev_thread_tid + ") Thread Switch")
+            out.append("  (...)")
+
+
+        for line in lines:
+            if len(line) == 0:
+                continue
+            if line.startswith(str(self.curr_event_id) + ":"):
+                line = "> " + line
             else:
-                length = self.row_length
-            self.table[address] = length
-        else:
-            raise Exception('Specify an address')
+                line = "  " + line
+            out.append(line.rstrip())
 
-    def unwatch(self, arg):
-        if arg:
-            try:
-                del self.table[Memory.parse_as_address(arg)]
-            except KeyError:
-                raise Exception('Memory region not watched')
-        else:
-            raise Exception('Specify an address')
+        next_thread_tid = next_thread.split(":")[1].split(",")[0]
+        next_thread_time = next_thread.split(":")[1].split(",")[1]
+        if next_thread_tid != "-1":
+            out.append("  (...)")
+            out.append("  " + next_thread_time + ": (tid:" + next_thread_tid + ") Thread Switch")
 
-    def clear(self, arg):
-        self.table.clear()
-
-    def commands(self):
-        return {
-            'watch': {
-                'action': self.watch,
-                'doc': 'Watch a memory region by address and length.\n'
-                       'The length defaults to 16 byte.',
-                'complete': gdb.COMPLETE_EXPRESSION
-            },
-            'unwatch': {
-                'action': self.unwatch,
-                'doc': 'Stop watching a memory region by address.',
-                'complete': gdb.COMPLETE_EXPRESSION
-            },
-            'clear': {
-                'action': self.clear,
-                'doc': 'Clear all the watched regions.'
-            }
-        }
+        return out
 
 class Registers(Dashboard.Module):
     """Show the CPU registers and their values."""
